@@ -7,57 +7,7 @@ import numpy as np
 from math import sqrt
 from utils.masking import TriangularCausalMask, ProbMask
 
-"""
 
-class FullAttention(nn.Module):   # Self-Attention mechanism(option 1)
-    #def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
-    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False, num_positions=100):
-        super(FullAttention, self).__init__()
-        self.scale = scale
-        self.mask_flag = mask_flag
-        self.output_attention = output_attention
-        self.dropout = nn.Dropout(attention_dropout)
-
-        self.num_positions = num_positions
-        self.positions_embeddings = nn.Embedding(num_positions * 2, 1)
-        
-    def forward(self, queries, keys, values, attn_mask):
-        B, L, H, E = queries.shape
-        _, S, _, D = values.shape
-        scale = self.scale or 1./sqrt(E)
-
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
-
-        # Compute relative position indices
-        relative_positions = torch.arange(L, device=queries.device).unsqueeze(1) - torch.arange(S, device=keys.device).unsqueeze(0)
-        relative_positions += self.num_positions  # Shift to non-negative values
-        relative_positions = torch.clamp(relative_positions, 0, 2 * self.num_positions - 1)
-
-        # Retrieve relative position bias
-        relative_bias = self.position_embeddings(relative_positions)  # Shape: [L, S, 1]
-        relative_bias = relative_bias.squeeze(-1)  # Shape: [L, S]
-
-        # Expand dimensions to match scores: [B, H, L, S]
-        relative_bias_expanded = relative_bias.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-
-        scores += relative_bias_expanded
-
-
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
-
-            scores.masked_fill_(attn_mask.mask, -np.inf)
-
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
-        V = torch.einsum("bhls,bshd->blhd", A, values)
-        
-        if self.output_attention:
-            return (V.contiguous(), A)
-        else:
-            return (V.contiguous(), None)
-
-"""
 
 class FullAttention(nn.Module):
     def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
@@ -178,185 +128,10 @@ class ProbAttention(nn.Module):   # Self-Attention mechanism(option 2)
         
         return context.transpose(2,1).contiguous(), attn
 
-"""
-class ProbAttention(nn.Module):
-    #def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
-    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False, num_positions=100, D=64):
-        super(ProbAttention, self).__init__()
-        self.factor = factor
-        self.scale = scale
-        self.mask_flag = mask_flag
-        self.output_attention = output_attention
-        self.dropout = nn.Dropout(attention_dropout)
-        self.projection = nn.Linear(D, 1)
-
-        # Initialization
-        self.position_embeddings = nn.Embedding(num_positions * 2, 1)
-        #self.position_embeddings = nn.Embedding(num_positions * 2, D)   #  or D 
-        self.num_positions = num_positions
-
-    def _prob_QK(self, Q, K, sample_k, n_top): # n_top: c*ln(L_q)
-        # Q [B, H, L, D]
-        B, H, L_K, E = K.shape
-        _, _, L_Q, _ = Q.shape
-
-        # calculate the sampled Q_K
-        K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
-        index_sample = torch.randint(L_K, (L_Q, sample_k)) # real U = U_part(factor*ln(L_k))*L_q
-        K_sample = K_expand[:, :, torch.arange(L_Q).unsqueeze(1), index_sample, :]
-        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)
-
-        # find the Top_k query with sparisty measurement
-        M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
-        M_top = M.topk(n_top, sorted=False)[1]
-
-        # use the reduced Q to calculate Q_K
-        Q_reduce = Q[torch.arange(B)[:, None, None],
-                     torch.arange(H)[None, :, None],
-                     M_top, :] # factor*ln(L_q)
-        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1)) # factor*ln(L_q)*L_k
-
-        return Q_K, M_top
-
-    def _get_initial_context(self, V, L_Q):
-        B, H, L_V, D = V.shape
-        if not self.mask_flag:
-            # V_sum = V.sum(dim=-2)
-            V_sum = V.mean(dim=-2)
-            contex = V_sum.unsqueeze(-2).expand(B, H, L_Q, V_sum.shape[-1]).clone()
-        else: # use mask
-            assert(L_Q == L_V) # requires that L_Q == L_V, i.e. for self-attention only
-            contex = V.cumsum(dim=-2)
-        return contex
-
-    def _update_context(self, context_in, V, scores, index, L_Q, attn_mask):
-        B, H, L_V, D = V.shape
-
-        if self.mask_flag:
-            attn_mask = ProbMask(B, H, L_Q, index, scores, device=V.device)
-            scores.masked_fill_(attn_mask.mask, -np.inf)
-
-    
-
-        attn = torch.softmax(scores, dim=-1) # nn.Softmax(dim=-1)(scores)
-
-        context_in[torch.arange(B)[:, None, None],
-                   torch.arange(H)[None, :, None],
-                   index, :] = torch.matmul(attn, V).type_as(context_in)
-        if self.output_attention:
-            attns = (torch.ones([B, H, L_V, L_V])/L_V).type_as(attn).to(attn.device)
-            attns[torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :] = attn
-            return (context_in, attns)
-        else:
-            return (context_in, None)
-
-    def forward(self, queries, keys, values, attn_mask):
-        B, L_Q, H, D = queries.shape
-        #print(f"D={queries.size(3)}")
-        _, L_K, _, _ = keys.shape
-        #print(f"D={keys.size(3)}")
-
-        queries = queries.transpose(2,1)
-        keys = keys.transpose(2,1)
-        values = values.transpose(2,1)
-
-        U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item() # c*ln(L_k)
-        u = self.factor * np.ceil(np.log(L_Q)).astype('int').item() # c*ln(L_q) 
-
-        U_part = U_part if U_part<L_K else L_K
-        u = u if u<L_Q else L_Q
-
-        # Compute sparse attention scores
-        scores_top ,index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u)    # [B, H, u, L_K]
-
-        #print(f"index.shape:{index.shape}")   #    index.shape:torch.Size([32, 8, 20])
-        #print(f"scores_top:{scores_top.shape}")   #   scores_top:torch.Size([32, 8, 20, 50])
-        #################################################################################################
-        #Check the To Do List
-
-
-        ################################################################################################
-    
-        # Compute relative position bias
-        relative_positions = torch.arange(L_Q, device=queries.device).unsqueeze(1) - torch.arange(L_K, device=keys.device).unsqueeze(0)    # [L_Q, L_K]
-        relative_positions += self.num_positions
-        relative_positions = torch.clamp(relative_positions, 0, 2 * self.num_positions - 1)    
-
-        relative_bias = self.position_embeddings(relative_positions)  # Shape: [L_Q, L_K, D = seq_len]
-        #print(f"relative_bias:{relative_bias.shape}")    #   relative_bias_expanded:torch.Size([50, 50, 64])
-        # Expand relative_bias to include batch and head dimensions
-        relative_bias_expanded = relative_bias.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1, -1)  # Shape: [B, H, 50, 50, 64] = [B, H, L_Q, L_K, D]
-        #print(f"relative_bias_expanded.shape:{relative_bias_expanded.shape}")   #   relative_bias.shape:torch.Size([50, 50, 30])
-
-
-
-         # Gather only relevant biases
-        index_expanded = index.unsqueeze(-1).expand(-1, -1, -1, D)  # [B, H, u, L_K, D]  ,  index_expanded.shape:torch.Size([32, 8, 20, 64])
-        #print(f"index_expanded.shape:{index_expanded.shape}")  #  index_expanded.shape:torch.Size([32, 8, 20, 64])
-        #relative_bias_selected = torch.gather(relative_bias.unsqueeze(0), 1, index_expanded)  # Shape: [B, H, u, D]
-        #relative_bias_selected = torch.gather(relative_bias, 1, index_expanded)  # Shape: [B, H, u, D] , #   Contains the positional biases for the top-4 queries.
-
-        # Use advanced indexing to gather the relevant positional biases
-        batch_indices = torch.arange(B).view(B, 1, 1, 1).expand(-1, H, u, D)  # Shape: [B, H, u, D] , batch_indices.shape:torch.Size([32, 8, 20, 64])
-        #print(f"batch_indices.shape:{batch_indices.shape}")
-        head_indices = torch.arange(H).view(1, H, 1, 1).expand(B, -1, u, D)   # Shape: [B, H, u, D], head_indices.shape:torch.Size([32, 8, 20, 64])
-        #print(f"head_indices.shape:{head_indices.shape}")
-        query_indices = index_expanded  # Shape: [B, H, u, D], query_indices.shape:torch.Size([32, 8, 20, 64])
-        #print(f"query_indices.shape:{query_indices.shape}")
-
-        #    index.shape:torch.Size([32, 8, 20]) ----> ([32, 8, 20, 1])  ----> ([32, 8, 20, 64])
-        index_expanded = index.unsqueeze(-1).expand(-1, -1, -1, L_K)   # [B, H, u, L_K, D] = [32, 8, 20, 50, 64]
-        #print(f" index_expanded.shape:{ index_expanded.shape}")
-        index_expanded = index_expanded.unsqueeze(-1)
-        #print(f" index_expanded.shape:{ index_expanded.shape}")   #  index_expanded.shape:torch.Size([32, 8, 20, 50])
-        ##index_expanded = index_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, D)
-        #print(f" index_expanded.shape:{ index_expanded.shape}")   #   index_expanded.shape:torch.Size([32, 8, 20, 50, 64])
-        #index_expanded = index_expanded.transpose(2, 3)
-        # [32, 8, 20, 64] -----> [32, 8, 20, 50, 64]
-
-
-        # Gather the relevant positional biases
-        #relative_bias_selected = relative_bias_expanded[batch_indices, head_indices, query_indices]  # Shape: [B, H, u, D]
-        relative_bias_selected = torch.gather(
-        relative_bias_expanded, 2, index_expanded
-        ) 
-        #print(f"relative_bias_selected.shape:{relative_bias_selected.shape}")   # Shape: [B, H, u, L_K, D], relative_bias_selected.shape:torch.Size([32, 8, 20, 50, 64])
-
-        
-
-        #relative_bias_selected = torch.gather(relative_bias_expanded, 2, index_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, D))  # Shape: [B, H, u, L_K, D]
-        #relative_bias_selected = relative_bias_selected.squeeze(-2)  # Shape: [B, H, u, D]
-
-        #relative_bias_selected = self.projection_layer(relative_bias_selected)  # Shape: [B, H, u, L_K]
-
-        # Add position bias to attention scores
-        #scores_top = scores_top + relative_bias_selected.permute(0, 1, 3, 2)  # [B, H, u, L_K]
-        #scores_top.shape:torch.Size([32, 8, 20, 50])
-        scores_top = scores_top.unsqueeze(-1)
-        scores_top = scores_top + relative_bias_selected     # Shape: [B, H, u, L_K]  
-        #print(f"scores_top.shape:{scores_top.shape}")   # relative_bias_selected.shape:torch.Size([32, 8, 20, 50, 64])
-
-        #scores_top = self.projection(scores_top)
-        scores_top = scores_top.squeeze(-1)
-        #print(f"scores_top.shape:{scores_top.shape}") 
-
-
-        # Scale and get context
-
-        scale = self.scale or 1./sqrt(D)
-        if scale is not None:
-           scores_top *= scale
-        context = self._get_initial_context(values, L_Q)
-        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)
-
-        return context.transpose(2, 1).contiguous(), attn
-
-"""
 
 
 class AttentionLayer(nn.Module):   # Cross-Attention mechanism
     def __init__(self, attention, d_model, n_heads, d_keys=None, d_values=None, mix=False):
-    #def __init__(self, attention, d_model, n_heads,d_keys=None, d_values=None, mix=False, num_positions=100):
         super(AttentionLayer, self).__init__()
 
         d_keys = d_keys or (d_model//n_heads)
@@ -372,15 +147,7 @@ class AttentionLayer(nn.Module):   # Cross-Attention mechanism
 
        
     def forward(self, queries, keys, values, attn_mask):
-        #print(f'queries.shape:{queries.shape}')
-        # Handle 4D inputs (multi-scale support)
-        # Check dimensions
-        #if len(queries.shape) != 3 or len(keys.shape) != 3 or len(values.shape) != 3:
-            #print(f'dim_queries:{queries.shape}')
-            #print(f'dim_keys:{keys.shape}')
-            #print(f'dim_values:{values.shape}')
-            #raise ValueError("Cross-attention expects 3D inputs for queries, keys, and values.")
-
+      
         if len(keys.shape) == 4 or len(values.shape) == 4:  # [B, num_scales, seq_len, D]
             B, L, D = queries.shape
             B, num_scales, S, D = keys.shape
