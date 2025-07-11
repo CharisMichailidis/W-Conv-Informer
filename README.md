@@ -73,7 +73,7 @@ This model was benchmarked against the original Informer and LSTM baselines on h
 ##  Installation
 
 ```bash
-git clone https://github.com/your-username/W-Conv-Informer.git
+git clone https://github.com/CharisMichailidis/W-Conv-Informer.git
 cd W-Conv-Informer
 pip install -r requirements.txt
 
