@@ -62,7 +62,7 @@ This architecture enhances the **temporal locality awareness** of the Informer w
 
 ##  Experiments
 
-This model was benchmarked against the original Informer and LSTM baselines on hourly and daily datasets. The W-Conv-Informer showed:
+This model was benchmarked against the original Informer baseline on hourly and daily datasets. The W-Conv-Informer showed:
 - Improved generalization
 - Lower MSE
 - Better training stability
